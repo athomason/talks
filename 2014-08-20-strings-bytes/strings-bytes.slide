@@ -1,0 +1,220 @@
+string ⇔ []byte: do's and don'ts
+August 20, 2014
+
+Adam Thomason
+Fastly
+adam@fastly.com
+https://www.fastly.com
+
+
+* Basics
+
+- *string* and *[]byte*: both views of arrays of bytes
+- many similarities; see package bytes and package strings
+
+	package reflect
+
+	type StringHeader struct {
+			Data uintptr
+			Len  int
+	}
+
+	type SliceHeader struct {
+			Data uintptr
+			Len  int
+			Cap  int
+	}
+
+- strings are read-only, []bytes are writeable
+- easily convertible
+
+* Strings
+
+- string literals in Go sources are UTF-8
+- but in general strings *do*not* contain Unicode!
+
+* String temptations
+
+- cleaner syntax
+.code syntax.go /START OMIT/,/END OMIT/
+- faster to copy
+# go test -bench Copy
+	BenchmarkCopyString 2000000000           0.64 ns/op
+	BenchmarkCopyBytes  2000000000           0.98 ns/op
+- contents are arbitrary
+- optimizations on immutability
+- fmt.Stringer()
+
+* Why use []byte?
+
+- package io: everything is a []byte
+- especially Reader and Writer
+- rest of stdlib: net, compress, crypto, …
+- backing memory can be reused
+
+* Conversion
+
+Trivial to do!
+
+.link https://golang.org/ref/spec#Conversions
+
+- _2._Converting_a_slice_of_bytes_to_a_string_type_yields_a_string_whose_successive_bytes_are_the_elements_of_the_slice._
+	data := []byte{'f', 'o', 'o'}
+	str := string(data) // "foo"
+
+- _4._Converting_a_value_of_a_string_type_to_a_slice_of_bytes_type_yields_a_slice_whose_successive_elements_are_the_bytes_of_the_string._
+	str := "bar"
+	data := []byte(str) // []byte{'b', 'a', 'r'}
+
+* Copies and garbage: a necessary evil
+
+.play convert.go /START OMIT/,/END OMIT/
+
+- compiler generally must copy the backing array
+- even if w.Write doesn't mutate its arg
+- []byte escapes WriteFoo, becomes garbage
+
+* Example 1: network demuxer
+
+* demuxer
+
+- single input stream, multiple outputs
+- record-per-line
+- destination based on contents
+
+	VCL_LOG 24405 1408582101.421917468 nxi38mofe4lincbYBgRT5J:syslog 2p74rsxvG9H5ljqWwS3tHJ fastly-www :: 68.127.39.191 www.imgs.com "-" "-" Thu, 21 Aug 2014 00:48:21 GMT "GET / ...
+	VCL_LOG 9871 1408582101.421648622 5mxkdeInwiLijej017NWm3:syslog 5mxkdeInwiLijej017NWm3 imgs-fastly/api :: api.imgs.com 72.75.112.24 1408582101 "GET / ...
+	VCL_LOG 20078 1408582101.421254496 nskIWmehicj0MWh21j2GDZ:syslog nskIWmehicj0MWh21j2GDZ imgs-fastly/image-views-logs :: imgs-images.s3.amazonaws.com 224.71.83.14 1408582101 "GET / ...
+	VCL_LOG 19804 1408582101.323757520 mxo3MO9tNJ3bGO150c5Ra1:syslog mxo3MO9tNJ3bGO150c5Ra1 fastly-cdn-dump :: 119.56.125.215 "-" "-" Thu, 21 Aug 2014 00:48:21 GMT GET ...
+	VCL_LOG 21200 1408582101.421029192 opO92n3977ldHNWImcqGDZ:syslog mxi92n3977ldHNWImcqGDZ imgs-fastly/image-views-logs :: imgs-images.s3.amazonaws.com 12.12.178.169 1408582101 "GET / ...
+
+* demuxer
+
+- bufio.Scanner: _"Scanner_provides_a_convenient_interface_for_reading_data_such_as_a_file_of_newline-delimited_lines_of_text."_
+
+	// worker goroutines consume from chan c
+	c := make(chan string)
+	go func() {
+		str := <-c
+		dest := parseDest(str)
+		conn := getConn(dest)
+		io.WriteString(conn, str)
+	}()
+
+	// input loop dispatches to workers
+	for scanner.Scan() {
+		c <- scanner.Text()
+	}
+
+* demuxer
+
+- Gotcha: Scanner.Text() returns _"a_newly_allocated_string_holding_its_bytes"_
+- io.WriteString:
+	return w.Write([]byte(s))
+- copy _and_ garbage
+
+* demuxer
+
+- compare to Scanner.Bytes() []byte: _"It_does_no_allocation."_
+
+	// worker goroutines consume from chan c
+	c := make(chan []byte)
+	go func() {
+		data := <-c
+		dest := parseDest(data)
+		conn := getConn(dest)
+		conn.Write(data) // no copy
+	}()
+
+	// input loop dispatches to workers
+	for scanner.Scan() {
+		c <- scanner.Bytes()
+	}
+
+* demuxer
+
+- oops!
+
+	// worker goroutines consume from chan c
+	c := make(chan []byte)
+	go func() {
+		data := <-c
+		dest := parseDest(data)
+		conn := getConn(dest)
+		conn.Write(data) // data may have changed
+	}()
+
+	// input loop dispatches to workers
+	for scanner.Scan() {
+		c <- scanner.Bytes()
+	}
+
+* demuxer
+
+- still need to make a copy
+- but you can reuse []byte buffers, e.g. sync.Pool
+
+	// worker goroutines consume from chan c
+	c := make(chan []byte)
+	go func() {
+		data := <-c
+		dest := parseDest(data)
+		conn := getConn(dest)
+		conn.Write(data)
+		putIntoPool(data)
+	}()
+
+	// input loop dispatches to workers
+	for scanner.Scan() {
+		data := scanner.Bytes()
+		c <- getFromPool(data)
+	}
+
+* Example 2: []byte as map key
+
+* []byte as map key
+
+- common desire: do map look up from external data
+
+.play map_string.go /START OMIT/,/END OMIT/
+
+* []byte as map key
+
+- lookup by byte slice instead?
+
+.play map_slice.go /START OMIT/,/END OMIT/
+
+* []byte as map key
+
+- don't call String(), but use a type conversion ourselves
+
+.play map_string2.go /START OMIT/,/END OMIT/
+
+- since Go 1.3, no copy is made
+# go test -bench Map
+
+	go 1.2.2:
+	BenchmarkMapString    109 allocs/op
+	BenchmarkMapBytes     114 allocs/op
+
+	go 1.3.1:
+	BenchmarkMapString    102 allocs/op
+	BenchmarkMapBytes       7 allocs/op
+
+.link https://code.google.com/p/go/issues/detail?id=3512
+
+* Takeaway
+
+- stick with whatever type your APIs use until you need to convert
+- know what copies your APIs make
+- be aware of allocs, copies, and escaping garbage
+- use testing.B.ReportAllocs
+- monitor runtime.MemStats in production
+- net/http/pprof is awesome
+
+* Further reading
+
+.link http://blog.golang.org/slices
+.link http://blog.golang.org/strings
+.link http://blog.golang.org/go-slices-usage-and-internals
+.link http://blog.golang.org/profiling-go-programs
